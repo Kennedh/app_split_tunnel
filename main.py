@@ -34,6 +34,7 @@ from modules.checker import ProxyChecker, ProxyResult
 from modules.launcher import find_default_executable, launch_application
 from modules.pac import PacServer, build_pac
 from modules.paths import resource_root, state_root
+from modules.rtc_inspector import RtcInspector, find_default_media_log
 from modules.scraper import ProxyScraper
 from modules.singbox import SingBoxEngine, SingBoxError
 
@@ -182,10 +183,73 @@ def _install_loop_exception_filter() -> None:
     loop.set_exception_handler(handler)
 
 
+def _rtc_console_event(event: dict, session) -> None:
+    kind = event.get("type")
+    if kind == "log_attached":
+        console.print(f"[dim]RTC Inspector acompanhando: {event.get('path')}[/dim]")
+    elif kind == "media_endpoint":
+        console.print(
+            f"[cyan]RTC[/cyan] endpoint={event.get('remote')} "
+            f"audio_ssrc={event.get('audio_ssrc')}"
+        )
+    elif kind == "local_transport":
+        console.print(
+            f"[cyan]RTC[/cyan] transporte local={event.get('local')} "
+            f"protocolo={event.get('protocol')}"
+        )
+    elif kind == "video_discovered":
+        console.print(
+            f"[magenta]RTC vídeo[/magenta] SSRC={event.get('ssrc')} "
+            f"RTX={event.get('rtx_ssrc')} active={event.get('active')}"
+        )
+    elif kind == "video_activated":
+        console.print(
+            "[bold magenta]RTC vídeo ATIVADO[/bold magenta] "
+            f"SSRC={event.get('ssrc')} RTX={event.get('rtx_ssrc')} "
+            f"endpoint={event.get('remote')}"
+        )
+        console.print(
+            "[yellow]Se a câmera estava desligada e você acabou de iniciar o compartilhamento, "
+            "este SSRC é um forte candidato da transmissão de tela.[/yellow]"
+        )
+
+
+async def run_rtc_inspect_only(args: argparse.Namespace) -> None:
+    state = state_root()
+    runtime = state / "runtime"
+    runtime.mkdir(parents=True, exist_ok=True)
+    explicit_log = Path(args.rtc_log).expanduser() if args.rtc_log else None
+    found = explicit_log or find_default_media_log()
+    if found:
+        console.print(f"[green]RTC Inspector[/green] log inicial: {found}")
+    else:
+        console.print("[yellow]RTC Inspector aguardando o log de mídia aparecer...[/yellow]")
+    inspector = RtcInspector(runtime, log_path=explicit_log, on_event=_rtc_console_event)
+    inspector.start()
+    console.print(
+        "[bold]Teste sugerido:[/bold] entre em uma chamada com câmera desligada; "
+        "aguarde o endpoint UDP aparecer; então inicie o compartilhamento de tela."
+    )
+    console.print(f"Relatório: {inspector.report_path}")
+    console.print(f"Candidato de split: {inspector.candidate_path}")
+    started = asyncio.get_running_loop().time()
+    try:
+        while True:
+            await asyncio.sleep(0.5)
+            if args.rtc_duration > 0 and asyncio.get_running_loop().time() - started >= args.rtc_duration:
+                break
+    finally:
+        inspector.stop()
+
+
 async def run(args: argparse.Namespace) -> None:
     _install_loop_exception_filter()
     if os.name != "nt":
         raise RuntimeError("Esta edição foi preparada para Windows 10/11 64-bit.")
+
+    if args.rtc_inspect_only:
+        await run_rtc_inspect_only(args)
+        return
 
     resources = resource_root()
     state = state_root()
@@ -242,6 +306,7 @@ async def run(args: argparse.Namespace) -> None:
 
     child = None
     task = None
+    rtc_inspector = None
     try:
         console.print(f"[dim]Dados persistentes: {cache.runtime_dir}[/dim]")
         if args.proxy_window > 0:
@@ -264,6 +329,22 @@ async def run(args: argparse.Namespace) -> None:
                 "O caminho DIRECT não passa pelo engine local.[/bold green]"
             )
 
+        if args.rtc_inspect:
+            explicit_log = Path(args.rtc_log).expanduser() if args.rtc_log else None
+            rtc_inspector = RtcInspector(
+                cache.runtime_dir,
+                log_path=explicit_log,
+                on_event=_rtc_console_event,
+            )
+            rtc_inspector.start()
+            console.print(
+                f"[green]RTC Inspector ativo[/green]. Relatório: {rtc_inspector.report_path}"
+            )
+            console.print(
+                "[dim]Para identificar tela: câmera OFF -> entrar na voz -> iniciar compartilhamento. "
+                "O primeiro SSRC de vídeo que mudar para active=true será destacado.[/dim]"
+            )
+
         if args.rescrape_interval > 0:
             task = asyncio.create_task(rescrape_loop(scraper, cache, args.rescrape_interval, args.top_proxies))
 
@@ -275,6 +356,8 @@ async def run(args: argparse.Namespace) -> None:
     finally:
         if task:
             task.cancel()
+        if rtc_inspector:
+            rtc_inspector.stop()
         pac_server.stop()
         engine.stop()
 
@@ -303,6 +386,26 @@ def parse_args() -> argparse.Namespace:
         "--force-refresh",
         action="store_true",
         help="Ignora caches e baixa novamente todas as fontes públicas",
+    )
+    p.add_argument(
+        "--rtc-inspect",
+        action="store_true",
+        help="Acompanha o log RTC e identifica endpoint/SSRCs de áudio e vídeo sem alterar pacotes",
+    )
+    p.add_argument(
+        "--rtc-inspect-only",
+        action="store_true",
+        help="Executa somente o RTC Inspector; não inicia proxy nem aplicativo",
+    )
+    p.add_argument(
+        "--rtc-log",
+        help="Caminho opcional para um log de mídia específico",
+    )
+    p.add_argument(
+        "--rtc-duration",
+        type=float,
+        default=0.0,
+        help="No modo --rtc-inspect-only, encerra após N segundos; 0 fica acompanhando",
     )
     return p.parse_args()
 

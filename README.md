@@ -70,6 +70,48 @@ Para manter a allowlist no relay durante toda a execução:
 ApplicationSplitRouting.exe --proxy-window 0
 ```
 
+
+## Inspector opcional de mídia em tempo real
+
+A versão inclui um observador **somente leitura** para aplicações que expõem metadados RTC em log. Ele não captura, descriptografa nem altera pacotes. O objetivo é registrar:
+
+```text
+endpoint remoto UDP
+endpoint local
+SSRC de áudio
+SSRC/RTX de vídeo
+transições de vídeo inactive -> active
+```
+
+Integrado à execução normal:
+
+```powershell
+ApplicationSplitRouting.exe --rtc-inspect
+```
+
+Ou somente o inspector, com a aplicação já aberta:
+
+```powershell
+ApplicationSplitRouting.exe --rtc-inspect-only
+```
+
+Os resultados ficam em:
+
+```text
+runtime/rtc_session.json
+runtime/rtc_split_candidate.json
+```
+
+### Teste para identificar uma transmissão de tela
+
+1. entre em uma sessão RTC com câmera desligada;
+2. aguarde o inspector mostrar o endpoint e o SSRC de áudio;
+3. inicie o compartilhamento de tela;
+4. observe se um SSRC de vídeo muda para `active=true`;
+5. confira `runtime/rtc_split_candidate.json`.
+
+O arquivo de candidato é apenas diagnóstico. Em muitos sistemas RTC, áudio e vídeo compartilham o mesmo fluxo UDP/5-tuple; mandar só alguns SSRCs por outro IP público pode invalidar NAT/ICE/estado da sessão. Por isso esta versão mede primeiro e não ativa esse roteamento automaticamente.
+
 ## Gerar o EXE
 
 Requisitos para **compilar**: Windows 10/11 64-bit e Python 3.11+.
