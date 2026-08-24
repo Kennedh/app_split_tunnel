@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from config import LOCAL_SOCKS_HOST, LOCAL_SOCKS_PORT_END, LOCAL_SOCKS_PORT_START
+from modules.windows_job import KillOnCloseJob
 
 logger = logging.getLogger("split_tunnel.singbox")
 
@@ -43,6 +44,8 @@ class SingBoxEngine:
         self._log_handle = None
         self.listen_host = LOCAL_SOCKS_HOST
         self.listen_port: int | None = None
+        self._job = KillOnCloseJob()
+        self.kill_on_parent_exit = False
 
     def find_binary(self) -> Optional[Path]:
         candidates = [
@@ -194,6 +197,27 @@ class SingBoxEngine:
             text=True,
             creationflags=creationflags,
         )
+        try:
+            # Do not rely only on Python finally/atexit. Closing the console can
+            # terminate this process abruptly; the Windows Job Object then kills
+            # sing-box automatically when our job handle is closed by the OS.
+            self._job.create()
+            self._job.assign_process_handle(int(self.process._handle))
+            self.kill_on_parent_exit = True
+        except Exception as exc:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=2)
+            except Exception:
+                try:
+                    self.process.kill()
+                except Exception:
+                    pass
+            self.process = None
+            self._job.close()
+            raise SingBoxError(
+                f"Não foi possível vincular o sing-box ao ciclo de vida do aplicativo: {exc}"
+            ) from exc
         time.sleep(0.25)
         if self.process.poll() is not None:
             tail = self._read_log_tail()
@@ -224,6 +248,8 @@ class SingBoxEngine:
             except subprocess.TimeoutExpired:
                 self.process.kill()
         self.process = None
+        self.kill_on_parent_exit = False
+        self._job.close()
         if self._log_handle:
             try:
                 self._log_handle.close()

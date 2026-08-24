@@ -36,6 +36,7 @@ class ProxyCache:
         self.scanned_meta_path = self.runtime_dir / "scanned_proxies.meta.json"
         self.singbox_config = self.runtime_dir / "sing-box-split-tunnel.json"
         self.local_proxy_config = self.runtime_dir / "sing-box-local-proxy.json"
+        self.udp_path = self.runtime_dir / "working_udp_proxies.json"
 
     def load(self) -> List[str]:
         """Load the last fully validated relays.
@@ -76,6 +77,25 @@ class ProxyCache:
         temp = self.path.with_suffix(".tmp")
         temp.write_text(json.dumps(data, indent=2), encoding="utf-8")
         temp.replace(self.path)
+
+
+    def load_udp(self) -> List[str]:
+        """Load the last SOCKS5 relays that passed UDP ASSOCIATE + DNS."""
+        try:
+            data = json.loads(self.udp_path.read_text(encoding="utf-8"))
+            return _dedupe(data.get("proxies", []))
+        except (OSError, ValueError, TypeError):
+            return []
+
+    def save_udp(self, proxies: Iterable[str], details: list[dict] | None = None) -> None:
+        data = {
+            "saved_at": int(time.time()),
+            "proxies": _dedupe(proxies),
+            "details": details or [],
+        }
+        temp = self.udp_path.with_suffix(".tmp")
+        temp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        temp.replace(self.udp_path)
 
     def load_scanned(self) -> List[str]:
         """Load the harvested IP:PORT inventory without network access."""

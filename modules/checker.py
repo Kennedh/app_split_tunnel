@@ -146,10 +146,16 @@ class ProxyChecker:
     def _target_text(target: Target) -> str:
         return f"{target[0]}:{target[1]}"
 
-    async def _negotiate(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def _negotiate(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        timeout: float | None = None,
+    ) -> None:
+        deadline = self.connect_timeout if timeout is None else timeout
         writer.write(bytes([SOCKS_VERSION, 1, 0x00]))
-        await asyncio.wait_for(writer.drain(), self.connect_timeout)
-        resp = await asyncio.wait_for(reader.readexactly(2), self.connect_timeout)
+        await asyncio.wait_for(writer.drain(), deadline)
+        resp = await asyncio.wait_for(reader.readexactly(2), deadline)
         if resp[0] != SOCKS_VERSION:
             raise ConnectionError(f"bad SOCKS version 0x{resp[0]:02x}")
         if resp[1] != 0x00:
@@ -192,20 +198,22 @@ class ProxyChecker:
         return out[:3]
 
     async def _target_candidates(self, host: str) -> List[Tuple[str, str]]:
-        # The checker prefers locally-resolved IPv4 answers for repeatable latency measurements.
-        # Runtime Chromium SOCKS requests can still carry hostnames through the local relay.
-        # Limiting candidates here keeps phase 3 fast and avoids duplicate slow timeouts.
-        resolved = await self._resolve_ipv4(host)
-        if resolved:
-            return [("ipv4", ip) for ip in resolved[:2]]
-        return [("domain", host)]
+        # Runtime requests reach the SOCKS relay as hostnames. Probe the same path
+        # first (ATYP=DOMAIN), then fall back to locally-resolved IPv4 addresses.
+        # Some public SOCKS implementations/policies behave differently for
+        # domain and literal-IP CONNECT requests, so IP-only validation can
+        # incorrectly eliminate an otherwise usable relay.
+        candidates: List[Tuple[str, str]] = [("domain", host)]
+        for ip in await self._resolve_ipv4(host):
+            candidates.append(("ipv4", ip))
+        return candidates[:3]
 
     async def check_liveness(self, proxy: str) -> bool:
         writer = None
         try:
             host, port = self._split_host_port(proxy)
             reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), self.liveness_timeout)
-            await self._negotiate(reader, writer)
+            await self._negotiate(reader, writer, timeout=self.liveness_timeout)
             return True
         except Exception:
             return False
@@ -289,7 +297,19 @@ class ProxyChecker:
                     latency = await self._probe_connect(proxy, target, mode, connect_host)
                     successes.append((target_text, latency, mode))
                     break
-                except Exception:
+                except asyncio.TimeoutError:
+                    self.stats["CONNECT_TIMEOUT"] += 1
+                    continue
+                except (ConnectionResetError, BrokenPipeError):
+                    self.stats["CONNECT_RESET"] += 1
+                    continue
+                except OSError as exc:
+                    code = getattr(exc, "winerror", None) or getattr(exc, "errno", None)
+                    self.stats[f"CONNECT_OSERROR_{code}" if code is not None else "CONNECT_OSERROR"] += 1
+                    continue
+                except Exception as exc:
+                    name = type(exc).__name__.upper()
+                    self.stats[f"CONNECT_{name}"] += 1
                     continue
 
         if not successes:

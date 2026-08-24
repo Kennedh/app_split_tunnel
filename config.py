@@ -1,21 +1,39 @@
 """Central configuration for application-level selective split routing."""
 
-PROXY_SOURCES = [
+PROXY_SOURCES_PRIMARY = [
+    # Keep several independent feeds. The scraper deduplicates IP:PORT entries,
+    # so overlapping lists do not make the checker probe the same relay twice.
     "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
     "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+    "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt",
+    "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks5.txt",
+    "https://raw.githubusercontent.com/proxylist-to/proxy-list/main/socks5.txt",
+    "https://raw.githubusercontent.com/gproxynet/free-proxy-list/main/socks5.txt",
     "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/socks5.txt",
     "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
+
 ]
+
+# Very large feeds are fallback-only. They are not downloaded unless the
+# smaller primary feeds fail to produce even MIN_PROXIES usable relays.
+PROXY_SOURCES_FALLBACK = [
+    "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/socks5.txt",
+    "https://raw.githubusercontent.com/mzyui/proxy-list/main/socks5.txt",
+]
+
+# Backwards-compatible aggregate for tools that still import PROXY_SOURCES.
+PROXY_SOURCES = PROXY_SOURCES_PRIMARY + PROXY_SOURCES_FALLBACK
 
 # Fast checker defaults. Cache validation normally finishes in a few seconds;
 # the full public-list scan is only used when cached relays have died.
-CHECK_CONCURRENCY = 140
-CONNECT_TIMEOUT = 3.2
-LIVENESS_TIMEOUT = 1.6
+CHECK_CONCURRENCY = 220
+CONNECT_TIMEOUT = 2.8
+LIVENESS_TIMEOUT = 1.0
 TLS_TIMEOUT = 4.5
 PER_PROXY_TLS_TIMEOUT = 10.0
 TLS_BATCH_SIZE = 4
+SCAN_CHUNK_SIZE = 4000
 LATENCY_SAMPLES = 1
 
 MIN_PROXIES = 1
@@ -58,3 +76,18 @@ DEFAULT_PROXY_WINDOW_SECONDS = 25
 LOCAL_SOCKS_HOST = "127.0.0.1"
 LOCAL_SOCKS_PORT_START = 17980
 LOCAL_SOCKS_PORT_END = 18020
+
+
+# v13 experimental screen-share UDP tunnel.  The startup path remains the
+# PAC/TCP design; these settings are used only with --tunnel-screen.
+UDP_PROXY_TIMEOUT = 2.0
+UDP_PROXY_CONCURRENCY = 220
+UDP_PROXY_SCAN_CHUNK_SIZE = 4000
+UDP_PROXY_DNS_TARGET = ("1.1.1.1", 53)
+# Reject relays that technically implement UDP ASSOCIATE but are already too
+# slow during the probe to have a realistic chance of establishing RTC.
+UDP_PROXY_MAX_TOTAL_MS = 1500.0
+UDP_PROXY_MAX_RTT_MS = 700.0
+SCREEN_TUN_ROUTE_PREFIX = 16
+SCREEN_TUN_INTERFACE_NAME = "ast-rtc"
+SCREEN_TUN_ADDRESS = "172.28.240.1/30"

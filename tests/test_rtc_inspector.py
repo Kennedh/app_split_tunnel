@@ -37,3 +37,32 @@ def test_video_activation_is_detected_as_candidate_transition():
     assert activated[0]["ssrc"] == 11060
     assert activated[0]["rtx_ssrc"] == 11061
     assert p.session.active_video_ssrcs == [11060]
+
+
+def test_screen_share_uses_separate_session_and_keeps_default_voice():
+    p = RtcLogParser()
+    p.feed_line("16:38:12 > [Connection(default)] Creating connection to 104.29.142.187:19332 with audio ssrc: 11642")
+    p.feed_line("16:38:12 > [Connection(default)] Connected with local address 189.28.181.67:65199 and protocol: udp")
+
+    p.feed_line("16:38:28 > [Connection(stream)] Creating connection to 104.29.142.175:19337 with audio ssrc: 11598")
+    p.feed_line("16:38:28 > [Connection(stream)] Connected with local address 189.28.181.67:65399 and protocol: udp")
+    p.feed_line("16:38:28 > [Connection(stream)] capturing desktop (type: screen-handle, handle: 65537).")
+    payload = {
+        "streamParameters": [
+            {"type":"video","active":True,"rid":"100","ssrc":11599,"rtxSsrc":11600,"quality":100,"maxBitrate":9000000,"maxFrameRate":60,"maxResolution":{"type":"fixed","width":1920,"height":1080}}
+        ]
+    }
+    events = p.feed_line("16:38:28 > [Connection(stream)] updateVideoQuality: " + json.dumps(payload))
+
+    default = p.sessions["default"]
+    stream = p.sessions["stream"]
+    assert default.remote_endpoint == "104.29.142.187:19332"
+    assert default.local_endpoint == "189.28.181.67:65199"
+    assert default.audio_ssrc == 11642
+    assert stream.remote_endpoint == "104.29.142.175:19337"
+    assert stream.local_endpoint == "189.28.181.67:65399"
+    assert stream.audio_ssrc == 11598
+    assert stream.active_video_ssrcs == [11599]
+    assert stream.rtx_ssrcs == [11600]
+    assert stream.desktop_capture_seen is True
+    assert any(e["type"] == "screen_share_candidate" for e in events)

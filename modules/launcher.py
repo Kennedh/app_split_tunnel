@@ -5,7 +5,10 @@ import glob
 import logging
 import os
 import subprocess
-from typing import List, Optional
+import sys
+import threading
+from pathlib import Path
+from typing import Callable, List, Optional
 
 logger = logging.getLogger("split_tunnel.launcher")
 
@@ -51,6 +54,7 @@ def launch_application(
     executable: str,
     pac_url: str,
     extra_args: Optional[List[str]] = None,
+    capture_output: bool = False,
 ) -> subprocess.Popen:
     if not os.path.isfile(executable):
         raise FileNotFoundError(executable)
@@ -64,7 +68,72 @@ def launch_application(
     if extra_args:
         args.extend(extra_args)
     logger.info("Iniciando aplicativo com PAC seletiva: %s", " ".join(args))
+    if capture_output:
+        return subprocess.Popen(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
     return subprocess.Popen(args)
+
+
+def start_output_tee(
+    process: subprocess.Popen,
+    line_callback: Optional[Callable[[str], None]] = None,
+    log_path: Optional[Path] = None,
+) -> threading.Thread:
+    """Mirror captured child output to this console and an optional parser/log.
+
+    The desktop client emits detailed RTC metadata to its inherited stdout; the
+    native discord_media file does not necessarily contain those lines.  Keeping
+    a tee here lets the user see the exact same output while the RTC inspector
+    consumes it in real time.
+    """
+    if process.stdout is None:
+        raise RuntimeError("O processo alvo não foi iniciado com captura de saída.")
+
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def pump() -> None:
+        sink = None
+        try:
+            if log_path is not None:
+                sink = log_path.open("w", encoding="utf-8", errors="replace", buffering=1)
+            for line in process.stdout:
+                try:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+                if sink is not None:
+                    try:
+                        sink.write(line)
+                    except Exception:
+                        pass
+                if line_callback is not None:
+                    try:
+                        line_callback(line)
+                    except Exception:
+                        logger.exception("Falha ao processar uma linha da saída do aplicativo alvo")
+        finally:
+            try:
+                process.stdout.close()
+            except Exception:
+                pass
+            if sink is not None:
+                try:
+                    sink.close()
+                except Exception:
+                    pass
+
+    thread = threading.Thread(target=pump, name="target-output-tee", daemon=True)
+    thread.start()
+    return thread
 
 
 find_discord_executable = find_default_executable
