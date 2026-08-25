@@ -81,8 +81,8 @@ LOCAL_SOCKS_PORT_END = 18020
 # v13 experimental screen-share UDP tunnel.  The startup path remains the
 # PAC/TCP design; these settings are used only with --tunnel-screen.
 UDP_PROXY_TIMEOUT = 2.0
-UDP_PROXY_CONCURRENCY = 220
-UDP_PROXY_SCAN_CHUNK_SIZE = 4000
+UDP_PROXY_CONCURRENCY = 320
+UDP_PROXY_SCAN_CHUNK_SIZE = 1200
 UDP_PROXY_DNS_TARGET = ("1.1.1.1", 53)
 # Reject relays that technically implement UDP ASSOCIATE but are already too
 # slow during the probe to have a realistic chance of establishing RTC.
@@ -91,3 +91,23 @@ UDP_PROXY_MAX_RTT_MS = 700.0
 SCREEN_TUN_ROUTE_PREFIX = 16
 SCREEN_TUN_INTERFACE_NAME = "ast-rtc"
 SCREEN_TUN_ADDRESS = "172.28.240.1/30"
+
+# v13.3 foreign UDP hunt. Fresh metadata-backed feeds are tried before the
+# historical giant inventory. The egress country is verified with STUN + GeoIP.
+UDP_FOREIGN_EXCLUDED_COUNTRIES = ["BR"]
+UDP_FOREIGN_PREFLIGHT_TIMEOUT = 1.6
+UDP_FOREIGN_DEEP_TIMEOUT = 2.0
+UDP_FOREIGN_MAX_MEDIAN_RTT_MS = 550.0
+UDP_FOREIGN_MAX_P95_RTT_MS = 900.0
+UDP_FOREIGN_DEEP_SAMPLES = 5
+UDP_FOREIGN_MIN_DEEP_SUCCESS = 4
+UDP_FAILURE_COOLDOWN_SECONDS = 3600.0
+
+# Small/fresh SOCKS5 feeds used specifically by the UDP hunter. Metadata from
+# ProxyScrape is loaded separately and gets first priority.
+PROXY_SOURCES_UDP_FRESH = [
+    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt",
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
+    "https://raw.githubusercontent.com/r00tee/Proxy-List/main/Socks5.txt",
+    "https://raw.githubusercontent.com/Sage520/Proxy-List/main/socks5.txt",
+]

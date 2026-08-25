@@ -16,6 +16,7 @@ import struct
 import time
 from collections import Counter
 from dataclasses import dataclass
+import os
 from typing import Iterable, Optional
 
 from config import (
@@ -28,6 +29,236 @@ from config import (
 from modules.socks_utils import encode_socks_address
 
 logger = logging.getLogger("split_tunnel.udp_checker")
+
+
+
+
+@dataclass
+class StunProbeResult:
+    public_ip: str
+    public_port: int
+    rtt_ms: float
+    proxy_address: str
+    stun_server: str
+
+
+def _stun_binding_request() -> tuple[bytes, bytes]:
+    txid = os.urandom(12)
+    return struct.pack("!HHI", 0x0001, 0, 0x2112A442) + txid, txid
+
+
+def _parse_stun_public_endpoint(payload: bytes, txid: bytes) -> tuple[str, int]:
+    if len(payload) < 20:
+        raise ConnectionError("STUN_SHORT")
+    msg_type, msg_len, cookie = struct.unpack("!HHI", payload[:8])
+    if msg_type not in {0x0101, 0x0111} or cookie != 0x2112A442 or payload[8:20] != txid:
+        raise ConnectionError("STUN_INVALID_HEADER")
+    end = min(len(payload), 20 + msg_len)
+    pos = 20
+    mapped = None
+    while pos + 4 <= end:
+        attr_type, attr_len = struct.unpack("!HH", payload[pos:pos+4])
+        value = payload[pos+4:pos+4+attr_len]
+        if len(value) < attr_len:
+            break
+        if attr_type in {0x0020, 0x0001} and attr_len >= 8:
+            family = value[1]
+            port = struct.unpack("!H", value[2:4])[0]
+            if family == 0x01 and len(value) >= 8:
+                ip_bytes = bytearray(value[4:8])
+                if attr_type == 0x0020:
+                    port ^= (0x2112A442 >> 16)
+                    cookie_bytes = struct.pack("!I", 0x2112A442)
+                    ip_bytes = bytearray(a ^ b for a, b in zip(ip_bytes, cookie_bytes))
+                mapped = (socket.inet_ntoa(bytes(ip_bytes)), port)
+                break
+        pos += 4 + ((attr_len + 3) & ~3)
+    if mapped is None:
+        raise ConnectionError("STUN_NO_MAPPED_ADDRESS")
+    return mapped
+
+
+async def probe_stun_via_socks(
+    address: str,
+    stun_host: str = "stun.cloudflare.com",
+    stun_port: int = 3478,
+    timeout: float = 4.0,
+) -> StunProbeResult:
+    """Return the public UDP endpoint observed through a SOCKS5 relay using STUN."""
+    writer = None
+    udp = None
+    started = time.perf_counter()
+    try:
+        proxy_host, proxy_port = _parse_host_port(address)
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(proxy_host, proxy_port), timeout=timeout
+        )
+        writer.write(b"\x05\x01\x00")
+        await writer.drain()
+        greeting = await asyncio.wait_for(reader.readexactly(2), timeout=timeout)
+        if greeting != b"\x05\x00":
+            raise ConnectionError("STUN_SOCKS_NOAUTH_REJECTED")
+
+        loop = asyncio.get_running_loop()
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.bind(("0.0.0.0", 0))
+        udp.setblocking(False)
+        local_port = udp.getsockname()[1]
+        req = b"\x05\x03\x00\x01\x00\x00\x00\x00" + int(local_port).to_bytes(2, "big")
+        writer.write(req)
+        await writer.drain()
+        relay_host, relay_port = await asyncio.wait_for(_read_reply_endpoint(reader), timeout=timeout)
+        if relay_port <= 0:
+            raise ConnectionError("STUN_UDP_RELAY_PORT_ZERO")
+        if relay_host in {"0.0.0.0", "::"}:
+            relay_host = proxy_host
+        try:
+            relay_ip = str(ipaddress.ip_address(relay_host))
+        except ValueError:
+            info = await asyncio.wait_for(
+                loop.getaddrinfo(relay_host, relay_port, family=socket.AF_INET, type=socket.SOCK_DGRAM),
+                timeout=timeout,
+            )
+            relay_ip = info[0][4][0]
+
+        request, txid = _stun_binding_request()
+        frame = _udp_frame(stun_host, stun_port, request)
+        sent = time.perf_counter()
+        await asyncio.wait_for(loop.sock_sendto(udp, frame, (relay_ip, relay_port)), timeout=timeout)
+        data, _ = await asyncio.wait_for(loop.sock_recvfrom(udp, 4096), timeout=timeout)
+        received = time.perf_counter()
+        payload = _unwrap_udp_frame(data)
+        public_ip, public_port = _parse_stun_public_endpoint(payload, txid)
+        return StunProbeResult(
+            public_ip=public_ip,
+            public_port=public_port,
+            rtt_ms=(received - sent) * 1000.0,
+            proxy_address=address,
+            stun_server=f"{stun_host}:{stun_port}",
+        )
+    finally:
+        if udp is not None:
+            udp.close()
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+
+@dataclass
+class StunSeriesResult:
+    public_ip: str
+    public_port: int
+    rtts_ms: list[float]
+    samples_ok: int
+    samples_total: int
+    proxy_address: str
+    stun_server: str
+
+
+async def probe_stun_series_via_socks(
+    address: str,
+    samples: int = 5,
+    stun_host: str = "stun.cloudflare.com",
+    stun_port: int = 3478,
+    timeout: float = 2.0,
+    interval: float = 0.03,
+) -> StunSeriesResult:
+    """Probe several STUN packets through one UDP ASSOCIATE session.
+
+    This is intentionally different from calling :func:`probe_stun_via_socks`
+    repeatedly: RTC needs the UDP association to remain usable for more than a
+    single lucky datagram. Missing samples are tolerated and reported.
+    """
+    writer = None
+    udp = None
+    samples = max(1, int(samples))
+    rtts: list[float] = []
+    endpoints: list[tuple[str, int]] = []
+    try:
+        proxy_host, proxy_port = _parse_host_port(address)
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(proxy_host, proxy_port), timeout=timeout
+        )
+        writer.write(b"\x05\x01\x00")
+        await writer.drain()
+        greeting = await asyncio.wait_for(reader.readexactly(2), timeout=timeout)
+        if greeting != b"\x05\x00":
+            raise ConnectionError("STUN_SERIES_SOCKS_NOAUTH_REJECTED")
+
+        loop = asyncio.get_running_loop()
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.bind(("0.0.0.0", 0))
+        udp.setblocking(False)
+        local_port = udp.getsockname()[1]
+        req = b"\x05\x03\x00\x01\x00\x00\x00\x00" + int(local_port).to_bytes(2, "big")
+        writer.write(req)
+        await writer.drain()
+        relay_host, relay_port = await asyncio.wait_for(_read_reply_endpoint(reader), timeout=timeout)
+        if relay_port <= 0:
+            raise ConnectionError("STUN_SERIES_UDP_RELAY_PORT_ZERO")
+        if relay_host in {"0.0.0.0", "::"}:
+            relay_host = proxy_host
+        try:
+            relay_ip = str(ipaddress.ip_address(relay_host))
+        except ValueError:
+            info = await asyncio.wait_for(
+                loop.getaddrinfo(relay_host, relay_port, family=socket.AF_INET, type=socket.SOCK_DGRAM),
+                timeout=timeout,
+            )
+            relay_ip = info[0][4][0]
+
+        for index in range(samples):
+            request, txid = _stun_binding_request()
+            frame = _udp_frame(stun_host, stun_port, request)
+            sent = time.perf_counter()
+            try:
+                await asyncio.wait_for(loop.sock_sendto(udp, frame, (relay_ip, relay_port)), timeout=timeout)
+                # Ignore unrelated/late datagrams until this transaction arrives or timeout expires.
+                deadline = time.perf_counter() + timeout
+                while True:
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError()
+                    data, _ = await asyncio.wait_for(loop.sock_recvfrom(udp, 4096), timeout=remaining)
+                    payload = _unwrap_udp_frame(data)
+                    try:
+                        endpoint = _parse_stun_public_endpoint(payload, txid)
+                    except ConnectionError:
+                        continue
+                    endpoints.append(endpoint)
+                    rtts.append((time.perf_counter() - sent) * 1000.0)
+                    break
+            except Exception:
+                pass
+            if index + 1 < samples and interval > 0:
+                await asyncio.sleep(interval)
+
+        if not endpoints:
+            raise ConnectionError("STUN_SERIES_NO_RESPONSE")
+        ips = [ip for ip, _ in endpoints]
+        dominant_ip = max(set(ips), key=ips.count)
+        dominant = [ep for ep in endpoints if ep[0] == dominant_ip]
+        return StunSeriesResult(
+            public_ip=dominant_ip,
+            public_port=dominant[0][1],
+            rtts_ms=rtts,
+            samples_ok=len(endpoints),
+            samples_total=samples,
+            proxy_address=address,
+            stun_server=f"{stun_host}:{stun_port}",
+        )
+    finally:
+        if udp is not None:
+            udp.close()
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 @dataclass

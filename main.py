@@ -36,15 +36,29 @@ from config import (
     TLS_TIMEOUT,
     TOP_PROXIES,
     UDP_PROXY_SCAN_CHUNK_SIZE,
+    UDP_PROXY_CONCURRENCY,
+    UDP_FOREIGN_EXCLUDED_COUNTRIES,
+    UDP_FOREIGN_PREFLIGHT_TIMEOUT,
+    UDP_FOREIGN_DEEP_TIMEOUT,
+    UDP_FOREIGN_MAX_MEDIAN_RTT_MS,
+    UDP_FOREIGN_MAX_P95_RTT_MS,
+    UDP_FOREIGN_DEEP_SAMPLES,
+    UDP_FOREIGN_MIN_DEEP_SUCCESS,
+    UDP_FAILURE_COOLDOWN_SECONDS,
+    PROXY_SOURCES_UDP_FRESH,
 )
 from modules.cache import ProxyCache
 from modules.checker import ProxyChecker, ProxyResult
 from modules.launcher import find_default_executable, launch_application, start_output_tee
+from modules.geo import lookup_countries
 from modules.pac import PacServer, build_pac
 from modules.paths import resource_root, state_root
 from modules.rtc_inspector import RtcInspector, find_default_media_log
 from modules.rtc_tunnel import RtcTunnelEngine, RtcTunnelError, is_windows_admin
-from modules.udp_checker import UdpProxyChecker, UdpProxyResult
+from modules.udp_checker import UdpProxyChecker, UdpProxyResult, probe_stun_via_socks
+from modules.foreign_udp_scanner import ForeignProxySeed, ForeignUdpResult, ForeignUdpScanner, harvest_metadata_seeds
+from modules.warp_profile import WarpProfileError, WarpProfileManager
+from modules.warp_proxy import WarpProxyEngine, WarpProxyError
 from modules.scraper import ProxyScraper
 from modules.singbox import SingBoxEngine, SingBoxError
 
@@ -166,6 +180,136 @@ async def select_udp_proxy(
     raise RuntimeError(
         "Nenhum SOCKS5 com UDP ASSOCIATE funcional foi encontrado. "
         "O startup TCP continua utilizável, mas --tunnel-screen precisa de SOCKS5-UDP."
+    )
+
+
+async def select_foreign_udp_proxy(
+    cache: ProxyCache,
+    preferred: list[str],
+    force_scan: bool = False,
+    manual_proxy: str | None = None,
+    excluded_countries: set[str] | None = None,
+) -> ForeignUdpResult:
+    """Find a stable SOCKS5-UDP relay whose *actual STUN egress* is foreign.
+
+    v13.3 avoids walking the giant historical list first. It prioritizes a
+    fresh metadata feed, then small recently refreshed feeds, then the local
+    inventory, and only as a last resort the huge fallback feeds.
+    """
+    excluded = {c.upper() for c in (excluded_countries or set(UDP_FOREIGN_EXCLUDED_COUNTRIES))}
+
+    def scanner() -> ForeignUdpScanner:
+        return ForeignUdpScanner(
+            cache.runtime_dir,
+            excluded_countries=excluded,
+            concurrency=UDP_PROXY_CONCURRENCY,
+            preflight_timeout=UDP_FOREIGN_PREFLIGHT_TIMEOUT,
+            deep_timeout=UDP_FOREIGN_DEEP_TIMEOUT,
+            max_median_rtt_ms=UDP_FOREIGN_MAX_MEDIAN_RTT_MS,
+            max_p95_rtt_ms=UDP_FOREIGN_MAX_P95_RTT_MS,
+            deep_samples=UDP_FOREIGN_DEEP_SAMPLES,
+            min_deep_success=UDP_FOREIGN_MIN_DEEP_SUCCESS,
+            failure_cooldown_seconds=0 if force_scan else UDP_FAILURE_COOLDOWN_SECONDS,
+        )
+
+    async def try_group(seeds: list[ForeignProxySeed], label: str) -> ForeignUdpResult | None:
+        if not seeds:
+            return None
+        console.print(
+            f"[cyan]{label}[/cyan]: {len(seeds)} candidato(s), STUN rápido + país real + estabilidade UDP..."
+        )
+        sc = scanner()
+        found = await sc.scan(seeds, desired=1)
+        if not found:
+            console.print(f"[dim]{label}: nenhum estrangeiro estável. stats={sc.stats}[/dim]")
+            return None
+        best = found[0]
+        console.print(
+            f"[bold green]SOCKS5-UDP estrangeiro aprovado[/bold green]: {best.address} "
+            f"egress={best.egress_ip} país={best.egress_country} "
+            f"mediana={best.median_rtt_ms:.1f}ms p95={best.p95_rtt_ms:.1f}ms "
+            f"jitter={best.jitter_ms:.1f}ms confiabilidade={best.samples_ok}/{best.samples_total}"
+        )
+        cache.save_udp([best.address], [best.to_dict()])
+        return best
+
+    if manual_proxy:
+        result = await try_group(
+            [ForeignProxySeed(address=manual_proxy, source="manual")], "UDP manual"
+        )
+        if result is None:
+            raise RuntimeError(
+                f"O proxy UDP informado não passou STUN/país/estabilidade: {manual_proxy}"
+            )
+        return result
+
+    # 1) Last known-good and startup relays: tiny and cheap to revalidate.
+    cached: list[str] = []
+    if not force_scan:
+        cached.extend(cache.load_udp())
+    cached.extend(preferred)
+    cached.extend(cache.load())
+    cached = list(dict.fromkeys(cached))
+    result = await try_group(
+        [ForeignProxySeed(address=a, source="cache") for a in cached], "Cache UDP estrangeiro"
+    )
+    if result:
+        return result
+
+    # 2) Metadata-backed source: prefilters BR and slow/dead candidates before
+    # opening thousands of sockets, while STUN still verifies the real egress.
+    console.print(
+        "[cyan]UDP Hunt v13.3[/cyan]: carregando feed SOCKS5 recente com país/latência/uptime..."
+    )
+    metadata = await asyncio.to_thread(harvest_metadata_seeds, excluded)
+    result = await try_group(metadata[:2500], "Feed metadata")
+    if result:
+        return result
+
+    # 3) A few small/fresh raw feeds, refreshed frequently.
+    fresh = await asyncio.to_thread(ProxyScraper(PROXY_SOURCES_UDP_FRESH).harvest)
+    result = await try_group(
+        [ForeignProxySeed(address=a, source="fresh-feed") for a in fresh], "Feeds UDP frescos"
+    )
+    if result:
+        cache.save_scanned(list(dict.fromkeys(cache.load_scanned() + fresh)))
+        return result
+
+    # 4) Existing local inventory, but bounded chunks and cooldown history mean
+    # dead proxies from an immediate rerun are skipped cheaply.
+    inventory = list(dict.fromkeys(cache.load_scanned()))
+    random.SystemRandom().shuffle(inventory)
+    chunk_size = max(200, int(UDP_PROXY_SCAN_CHUNK_SIZE))
+    for offset in range(0, len(inventory), chunk_size):
+        chunk = inventory[offset:offset + chunk_size]
+        result = await try_group(
+            [ForeignProxySeed(address=a, source="local-inventory") for a in chunk],
+            f"Inventário UDP lote {offset // chunk_size + 1}",
+        )
+        if result:
+            return result
+
+    # 5) Last resort: huge feeds. Never the normal path.
+    console.print(
+        "[yellow]Nenhum relay estrangeiro estável nos feeds rápidos. Baixando fallback grande como último recurso...[/yellow]"
+    )
+    fallback = await asyncio.to_thread(ProxyScraper(PROXY_SOURCES_FALLBACK).harvest)
+    known = set(inventory)
+    fallback = [x for x in fallback if x not in known]
+    random.SystemRandom().shuffle(fallback)
+    for offset in range(0, len(fallback), chunk_size):
+        chunk = fallback[offset:offset + chunk_size]
+        result = await try_group(
+            [ForeignProxySeed(address=a, source="large-fallback") for a in chunk],
+            f"Fallback UDP lote {offset // chunk_size + 1}",
+        )
+        if result:
+            cache.save_scanned(list(dict.fromkeys(inventory + fallback)))
+            return result
+
+    raise RuntimeError(
+        "Nenhum SOCKS5-UDP estrangeiro suficientemente estável foi encontrado. "
+        "Consulte runtime\\udp_hunt_report.json e runtime\\udp_probe_history.json."
     )
 
 
@@ -393,17 +537,42 @@ def _rtc_console_event(event: dict, session) -> None:
 class ScreenTunnelCoordinator:
     """Arms the narrow RTC TUN once the default voice socket is known."""
 
-    def __init__(self, resources: Path, runtime_dir: Path, udp_proxy: UdpProxyResult, process_name: str, route_cidr: str | None = None):
+    def __init__(
+        self,
+        resources: Path,
+        runtime_dir: Path,
+        udp_proxy: UdpProxyResult,
+        process_name: str,
+        route_cidr: str | None = None,
+        backend_name: str = "public-socks-udp",
+        backend_egress_ip: str | None = None,
+        backend_egress_country: str | None = None,
+        startup_proxy_info: dict | None = None,
+    ):
         self.engine = RtcTunnelEngine(resources, runtime_dir)
         self.udp_proxy = udp_proxy
         self.process_name = process_name
         self.route_cidr_override = route_cidr
+        self.backend_name = backend_name
+        self.backend_egress_ip = backend_egress_ip
+        self.backend_egress_country = backend_egress_country
+        self.startup_proxy_info = startup_proxy_info or {}
         self._lock = threading.RLock()
         self._starting = False
         self._armed = False
         self._error: str | None = None
         self._route_cidr: str | None = None
+        self._voice_remote: str | None = None
+        self._voice_local: str | None = None
+        self._stream_remote: str | None = None
+        self._stream_local: str | None = None
+        self._stream_in_route: bool | None = None
+        self._screen_active = False
+        self._split_ever_validated = False
+        self._validated_at: int | None = None
+        self._validation_evidence: dict | None = None
         self.status_path = runtime_dir / "screen_tunnel_status.json"
+        self.validation_path = runtime_dir / "split_validation.json"
 
     @property
     def armed(self) -> bool:
@@ -416,8 +585,11 @@ class ScreenTunnelCoordinator:
             "armed": self._armed,
             "starting": self._starting,
             "error": self._error,
+            "backend": self.backend_name,
             "udp_proxy": self.udp_proxy.address,
             "udp_probe_ms": self.udp_proxy.latency_ms,
+            "backend_egress_ip": self.backend_egress_ip,
+            "backend_egress_country": self.backend_egress_country,
             "route_cidr": self._route_cidr,
             **extra,
         }
@@ -428,7 +600,87 @@ class ScreenTunnelCoordinator:
         except Exception:
             pass
 
+    @staticmethod
+    def _endpoint_ip(endpoint: str | None) -> str | None:
+        if not endpoint:
+            return None
+        try:
+            return endpoint.rsplit(":", 1)[0].strip("[]")
+        except Exception:
+            return None
+
+    def _write_validation(self, **extra) -> None:
+        voice_ip = self._endpoint_ip(self._voice_local)
+        screen_ip = self._endpoint_ip(self._stream_local)
+        separated = bool(voice_ip and self.backend_egress_ip and voice_ip != self.backend_egress_ip)
+        screen_matches_backend = bool(
+            screen_ip and self.backend_egress_ip and screen_ip == self.backend_egress_ip
+        )
+        currently_valid = bool(
+            separated
+            and screen_matches_backend
+            and self._armed
+            and self._screen_active
+            and self._stream_remote
+            and self._stream_in_route is True
+        )
+        if currently_valid and not self._split_ever_validated:
+            self._split_ever_validated = True
+            self._validated_at = int(time.time())
+            self._validation_evidence = {
+                "voice_egress_ip": voice_ip,
+                "screen_backend_egress_ip": self.backend_egress_ip,
+                "screen_backend_country": self.backend_egress_country,
+                "stream_remote_endpoint": self._stream_remote,
+                "stream_local_endpoint": self._stream_local,
+                "different_egress": separated,
+                "screen_observed_ip": screen_ip,
+                "screen_matches_backend_egress": screen_matches_backend,
+                "screen_video_activated": True,
+            }
+        payload = {
+            "updated_at": int(time.time()),
+            "backend": self.backend_name,
+            "startup_proxy": self.startup_proxy_info,
+            "voice": {
+                "remote_endpoint": self._voice_remote,
+                "local_endpoint": self._voice_local,
+                "public_ip_observed_by_rtc": voice_ip,
+                "route": "DIRECT",
+            },
+            "screen": {
+                "remote_endpoint": self._stream_remote,
+                "local_endpoint": self._stream_local,
+                "route": self.backend_name if self._armed else "not-armed",
+                "active": self._screen_active,
+            },
+            "udp_backend": {
+                "proxy": self.udp_proxy.address,
+                "egress_ip_stun": self.backend_egress_ip,
+                "egress_country": self.backend_egress_country,
+                "probe_ms": self.udp_proxy.latency_ms,
+            },
+            "different_udp_egress_ip": separated,
+            "screen_matches_backend_egress": screen_matches_backend,
+            "split_currently_active": currently_valid,
+            "split_ever_validated": self._split_ever_validated,
+            "validated_at": self._validated_at,
+            "validation_evidence": self._validation_evidence,
+            # Backwards-compatible name now means the proof was achieved at least once.
+            "split_validated": self._split_ever_validated,
+            **extra,
+        }
+        try:
+            tmp = self.validation_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            tmp.replace(self.validation_path)
+        except Exception:
+            pass
+
     def _start_worker(self, voice_remote: str, voice_local: str) -> None:
+        self._voice_remote = voice_remote
+        self._voice_local = voice_local
+        self._write_validation(tunnel_state="starting")
         try:
             route_cidr = self.engine.start(
                 udp_proxy=self.udp_proxy.address,
@@ -443,10 +695,16 @@ class ScreenTunnelCoordinator:
                 self._error = None
             console.print(
                 "[bold green]RTC SCREEN TUNNEL ARMADO[/bold green]: "
-                f"rota={route_cidr} proxy_UDP={self.udp_proxy.address}. "
+                f"rota={route_cidr} backend={self.backend_name} proxy_UDP={self.udp_proxy.address}. "
                 f"O servidor da voz {voice_remote.rsplit(':',1)[0]}/32 foi EXCLUÍDO do TUN e permanece DIRECT."
             )
+            if self.backend_egress_ip:
+                console.print(
+                    f"[cyan]UDP do backend observado via STUN:[/cyan] {self.backend_egress_ip} "
+                    f"({self.backend_egress_country or 'país ?'})"
+                )
             console.print("[yellow]Agora pode iniciar a transmissão de tela.[/yellow]")
+            self._write_validation(tunnel_state="armed")
         except Exception as exc:
             with self._lock:
                 self._error = str(exc)
@@ -459,6 +717,21 @@ class ScreenTunnelCoordinator:
     def handle_event(self, event: dict, session) -> None:
         kind = event.get("type")
         context = event.get("context", "default")
+        if context == "default":
+            if session.remote_endpoint:
+                self._voice_remote = session.remote_endpoint
+            if session.local_endpoint:
+                self._voice_local = session.local_endpoint
+        elif context == "stream":
+            if session.remote_endpoint:
+                self._stream_remote = session.remote_endpoint
+            if session.local_endpoint:
+                self._stream_local = session.local_endpoint
+            if kind in {"video_activated", "screen_share_candidate"}:
+                self._screen_active = True
+            elif kind in {"video_deactivated", "stream_session_stopped"}:
+                self._screen_active = False
+        self._write_validation(last_event=kind, last_context=context)
         if kind == "local_transport" and context == "default" and event.get("protocol") == "udp":
             with self._lock:
                 if self._armed or self._starting:
@@ -501,6 +774,7 @@ class ScreenTunnelCoordinator:
                         "Será necessário o backend WinDivert/5-tuple para separar este caso."
                     )
                     inside = False
+                    self._stream_in_route = False
                     self._write_status(
                         stream_remote=remote,
                         stream_in_route=False,
@@ -508,6 +782,7 @@ class ScreenTunnelCoordinator:
                         fallback="direct-safe",
                     )
                     return
+                self._stream_in_route = bool(inside and self.armed)
                 if inside and self.armed:
                     console.print(
                         f"[bold green]RTC stream elegível para o TUN[/bold green]: {remote} -> {self.udp_proxy.address}"
@@ -518,6 +793,7 @@ class ScreenTunnelCoordinator:
                         "Este stream provavelmente ficou DIRECT."
                     )
                 self._write_status(stream_remote=remote, stream_in_route=inside)
+                self._write_validation(stream_in_route=self._stream_in_route)
 
     def stop(self) -> None:
         self.engine.stop()
@@ -525,6 +801,7 @@ class ScreenTunnelCoordinator:
             self._armed = False
             self._starting = False
         self._write_status(stopped=True)
+        self._write_validation(tunnel_state="stopped")
 
 
 async def run_rtc_inspect_only(args: argparse.Namespace) -> None:
@@ -564,13 +841,14 @@ async def run(args: argparse.Namespace) -> None:
         await run_rtc_inspect_only(args)
         return
 
-    if args.tunnel_screen:
+    screen_tunnel_enabled = bool(args.tunnel_screen or args.tunnel_screen_warp)
+    if screen_tunnel_enabled:
         args.rtc_inspect = True
         if args.no_launch:
-            raise RuntimeError("--tunnel-screen precisa iniciar o aplicativo; não use junto com --no-launch")
+            raise RuntimeError("O screen tunnel precisa iniciar o aplicativo; não use junto com --no-launch")
         if not is_windows_admin():
             raise RuntimeError(
-                "--tunnel-screen é experimental e precisa de Terminal/PowerShell executado como Administrador "
+                "O screen tunnel experimental precisa de Terminal/PowerShell executado como Administrador "
                 "para criar a interface TUN estreita."
             )
 
@@ -586,16 +864,22 @@ async def run(args: argparse.Namespace) -> None:
     checker = None
     source = ""
 
+    # WARP validation only needs one TCP relay for the short startup window.
+    # Do not waste time hunting a redundant second public proxy while the UDP
+    # path is being validated independently through WARP.
+    startup_desired = 1 if args.tunnel_screen_warp else args.top_proxies
+    startup_minimum = 1 if args.tunnel_screen_warp else args.min_proxies
+
     # Tier 1: only the tiny pool that worked last time.
     if not args.force_scan and not args.force_refresh:
-        cached_result = await validate_cached_pool(cache, args.top_proxies, args.min_proxies)
+        cached_result = await validate_cached_pool(cache, startup_desired, startup_minimum)
         if cached_result is not None:
             selected_results, checker = cached_result
             source = "relays revalidados"
 
     # Tier 2: the previously harvested IP:PORT list, entirely offline.
     if selected_results is None and not args.force_refresh:
-        inventory_result = await validate_scanned_inventory(cache, args.top_proxies, args.min_proxies)
+        inventory_result = await validate_scanned_inventory(cache, startup_desired, startup_minimum)
         if inventory_result is not None:
             selected_results, checker = inventory_result
             source = "inventário local"
@@ -603,7 +887,7 @@ async def run(args: argparse.Namespace) -> None:
     # Tier 3: refresh public sources only when both local tiers failed.
     if selected_results is None:
         selected_results, checker = await fresh_scan(
-            cache, args.top_proxies, args.min_proxies
+            cache, startup_desired, startup_minimum
         )
         source = "fontes públicas atualizadas"
 
@@ -611,19 +895,104 @@ async def run(args: argparse.Namespace) -> None:
     cache.save(selected)
     show_pool(selected_results, checker, source)
 
+    startup_proxy_info = {"address": selected[0] if selected else None, "country": None}
+    try:
+        startup_ips = [item.rsplit(":", 1)[0].strip("[]") for item in selected[:3]]
+        startup_countries = await asyncio.to_thread(lookup_countries, startup_ips)
+        if selected:
+            startup_proxy_info["country"] = startup_countries.get(startup_ips[0])
+        (cache.runtime_dir / "startup_proxy_status.json").write_text(
+            json.dumps({
+                "updated_at": int(time.time()),
+                "selected": [
+                    {"address": item, "country": startup_countries.get(item.rsplit(":",1)[0].strip("[]"))}
+                    for item in selected
+                ],
+            }, indent=2),
+            encoding="utf-8",
+        )
+        if selected:
+            console.print(
+                f"[cyan]Proxy de startup:[/cyan] {selected[0]} país={startup_proxy_info.get('country') or '?'}"
+            )
+    except Exception as exc:
+        logger.warning("Geolocalização do proxy de startup indisponível: %s", exc)
+
     udp_proxy_result = None
-    if args.tunnel_screen:
-        console.print("[bold cyan]v13 experimental:[/bold cyan] procurando 1 SOCKS5 com UDP ASSOCIATE real para a transmissão...")
-        udp_proxy_result = await select_udp_proxy(
+    warp_proxy_engine = None
+    warp_egress_ip = None
+    warp_egress_country = None
+    if args.tunnel_screen_warp:
+        console.print(
+            "[bold cyan]v13.2 validação WARP:[/bold cyan] preparando egress UDP estável; "
+            "a varredura de SOCKS5-UDP públicos foi ignorada."
+        )
+        profile_manager = WarpProfileManager(resources, cache.runtime_dir)
+        profile = await asyncio.to_thread(profile_manager.ensure_profile, args.force_warp_profile)
+        warp_proxy_engine = WarpProxyEngine(resources, cache.runtime_dir)
+        warp_host, warp_port = await asyncio.to_thread(warp_proxy_engine.start, profile)
+        warp_socks = f"{warp_host}:{warp_port}"
+        checker_udp = UdpProxyChecker(timeout=5.0, concurrency=1, max_total_ms=0, max_udp_rtt_ms=0)
+        udp_proxy_result = await checker_udp.check_one(warp_socks)
+        if udp_proxy_result is None:
+            tail = warp_proxy_engine.log_path.read_text(encoding="utf-8", errors="replace")[-5000:] if warp_proxy_engine.log_path.exists() else ""
+            warp_proxy_engine.stop()
+            raise RuntimeError(
+                "Backend WARP abriu, mas o SOCKS local não completou UDP ASSOCIATE/DNS. "
+                f"Falhas={dict(checker_udp.stats)}. Log: {tail}"
+            )
+        stun = None
+        last_stun_error = None
+        for _ in range(3):
+            try:
+                stun = await probe_stun_via_socks(warp_socks, timeout=5.0)
+                break
+            except Exception as exc:
+                last_stun_error = exc
+                await asyncio.sleep(0.5)
+        if stun is None:
+            warp_proxy_engine.stop()
+            raise RuntimeError(f"WARP passou UDP, mas o probe STUN não retornou egress: {last_stun_error}")
+        warp_egress_ip = stun.public_ip
+        try:
+            warp_egress_country = (await asyncio.to_thread(lookup_countries, [warp_egress_ip])).get(warp_egress_ip)
+        except Exception:
+            warp_egress_country = None
+        warp_proxy_engine.update_status(
+            udp_associate_ok=True,
+            udp_dns_probe_ms=udp_proxy_result.udp_rtt_ms,
+            stun_server=stun.stun_server,
+            udp_egress_ip=stun.public_ip,
+            udp_egress_port=stun.public_port,
+            udp_egress_rtt_ms=stun.rtt_ms,
+            udp_egress_country=warp_egress_country,
+        )
+        console.print(
+            f"[bold green]WARP UDP pronto:[/bold green] egress={stun.public_ip}:{stun.public_port} "
+            f"país={warp_egress_country or '?'} STUN_RTT={stun.rtt_ms:.1f} ms"
+        )
+    elif args.tunnel_screen:
+        excluded_udp_countries = {
+            c.strip().upper() for c in (args.udp_exclude_countries or "BR").split(",") if c.strip()
+        }
+        console.print(
+            "[bold cyan]v13.3 UDP Hunt:[/bold cyan] procurando egress SOCKS5-UDP estrangeiro; "
+            f"país(es) excluído(s)={','.join(sorted(excluded_udp_countries)) or '-'}"
+        )
+        udp_proxy_result = await select_foreign_udp_proxy(
             cache,
             preferred=selected,
             force_scan=args.force_udp_scan,
             manual_proxy=args.udp_proxy,
+            excluded_countries=excluded_udp_countries,
         )
+        warp_egress_ip = udp_proxy_result.egress_ip
+        warp_egress_country = udp_proxy_result.egress_country
         console.print(
-            f"[bold green]Proxy UDP pronto:[/bold green] {udp_proxy_result.address} "
-            f"(setup {udp_proxy_result.setup_ms:.1f} ms, UDP RTT {udp_proxy_result.udp_rtt_ms:.1f} ms, "
-            f"total {udp_proxy_result.latency_ms:.1f} ms)"
+            f"[bold green]Proxy UDP estrangeiro pronto:[/bold green] {udp_proxy_result.address} "
+            f"egress={udp_proxy_result.egress_ip} ({udp_proxy_result.egress_country}) "
+            f"mediana={udp_proxy_result.median_rtt_ms:.1f} ms p95={udp_proxy_result.p95_rtt_ms:.1f} ms "
+            f"confiabilidade={udp_proxy_result.samples_ok}/{udp_proxy_result.samples_total}"
         )
 
     engine = SingBoxEngine(resources, state_dir=cache.runtime_dir)
@@ -652,13 +1021,17 @@ async def run(args: argparse.Namespace) -> None:
     rtc_inspector = None
     output_thread = None
     screen_coordinator = None
-    if args.tunnel_screen and udp_proxy_result is not None:
+    if screen_tunnel_enabled and udp_proxy_result is not None:
         screen_coordinator = ScreenTunnelCoordinator(
             resources=resources,
             runtime_dir=cache.runtime_dir,
             udp_proxy=udp_proxy_result,
             process_name=Path(target_exe).name,
             route_cidr=args.screen_route_cidr,
+            backend_name="warp" if args.tunnel_screen_warp else "public-socks-udp",
+            backend_egress_ip=warp_egress_ip,
+            backend_egress_country=warp_egress_country,
+            startup_proxy_info=startup_proxy_info,
         )
     try:
         console.print(f"[dim]Dados persistentes: {cache.runtime_dir}[/dim]")
@@ -671,9 +1044,11 @@ async def run(args: argparse.Namespace) -> None:
             console.print(
                 "[green]3/4[/green] Relay seletivo ativo durante toda a sessão; somente a allowlist usa SOCKS5."
             )
-        if args.tunnel_screen:
+        if screen_tunnel_enabled:
+            backend_text = "WARP" if args.tunnel_screen_warp else "SOCKS5-UDP público"
             console.print(
-                "[dim]Startup continua sem TUN. O TUN RTC estreito só será criado depois que a porta UDP da voz DIRECT for identificada.[/dim]"
+                f"[dim]Startup continua no proxy TCP selecionado. O TUN RTC estreito ({backend_text}) "
+                "só será criado depois que o endpoint UDP da voz DIRECT for identificado.[/dim]"
             )
         else:
             console.print(
@@ -732,7 +1107,7 @@ async def run(args: argparse.Namespace) -> None:
                     "[dim]Inspector v13 lendo o stdout do aplicativo em tempo real e gravando "
                     f"{cache.runtime_dir / 'target_stdout.log'}.[/dim]"
                 )
-            if args.tunnel_screen:
+            if screen_tunnel_enabled:
                 console.print(
                     "[bold yellow]Entre primeiro na voz e aguarde 'RTC SCREEN TUNNEL ARMADO'. "
                     "Só então inicie o compartilhamento.[/bold yellow]"
@@ -760,6 +1135,8 @@ async def run(args: argparse.Namespace) -> None:
             screen_coordinator.stop()
         pac_server.stop()
         engine.stop()
+        if warp_proxy_engine:
+            warp_proxy_engine.stop()
 
 
 def parse_args() -> argparse.Namespace:
@@ -801,9 +1178,22 @@ def parse_args() -> argparse.Namespace:
         "--tunnel-screen",
         action="store_true",
         help=(
-            "EXPERIMENTAL: mantém a porta UDP da voz DIRECT e tenta enviar a sessão RTC de screen-share "
-            "por um SOCKS5 que passou UDP ASSOCIATE. Exige Administrador."
+            "EXPERIMENTAL v13.3: mantém RTC/voz DIRECT e caça um SOCKS5-UDP com egress estrangeiro "
+            "validado por STUN + país + RTT + estabilidade para o screen-share. Exige Administrador."
         ),
+    )
+    p.add_argument(
+        "--tunnel-screen-warp",
+        action="store_true",
+        help=(
+            "EXPERIMENTAL/VALIDAÇÃO: startup continua no SOCKS5 TCP; voz RTC fica DIRECT e screen-share "
+            "usa um egress WARP userspace temporário. Ignora a busca de proxies UDP públicos."
+        ),
+    )
+    p.add_argument(
+        "--force-warp-profile",
+        action="store_true",
+        help=r"Regenera wgcf-profile.conf usando a identidade WARP persistida em runtime\warp",
     )
     p.add_argument(
         "--udp-proxy",
@@ -813,6 +1203,11 @@ def parse_args() -> argparse.Namespace:
         "--force-udp-scan",
         action="store_true",
         help="Ignora working_udp_proxies.json e procura novamente um relay SOCKS5-UDP",
+    )
+    p.add_argument(
+        "--udp-exclude-countries",
+        default="BR",
+        help="Países ISO separados por vírgula que não podem ser egress UDP (padrão: BR)",
     )
     p.add_argument(
         "--screen-route-cidr",
@@ -837,6 +1232,6 @@ if __name__ == "__main__":
         asyncio.run(run(parse_args()))
     except KeyboardInterrupt:
         pass
-    except (RuntimeError, SingBoxError, RtcTunnelError) as exc:
+    except (RuntimeError, SingBoxError, RtcTunnelError, WarpProfileError, WarpProxyError) as exc:
         console.print(f"[bold red]Erro:[/bold red] {exc}")
         sys.exit(1)

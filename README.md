@@ -306,3 +306,73 @@ A v13 original tentava manter a voz DIRECT usando a porta UDP local observada no
 Na v13.1 a proteção da voz é feita antes do TUN: o IP remoto exato da sessão `Connection(default)` é adicionado a `route_exclude_address` como `/32`. Assim o tráfego de voz não chega à interface TUN. O restante do bloco RTC continua elegível para o proxy UDP. Se `Connection(stream)` cair no mesmo IP remoto da voz, a versão falha de forma segura e deixa esse stream DIRECT, avisando que esse caso exige um backend de 5-tuple/WinDivert.
 
 A seleção de proxy UDP também rejeita relays que passam `UDP ASSOCIATE` mas são claramente lentos demais no probe. O terminal agora mostra `setup`, `UDP RTT` e `total` separadamente.
+
+
+## Validação temporária do split UDP (v13.2)
+
+Para separar a validação do roteamento da qualidade dos proxies UDP públicos, use:
+
+```powershell
+.\ApplicationSplitRouting.exe --tunnel-screen-warp
+```
+
+O startup continua usando o relay SOCKS5 TCP selecionado pelo projeto. O backend WARP é usado somente como egress UDP de teste para a `Connection(stream)`, enquanto o servidor da `Connection(default)`/voz é excluído da rota TUN e permanece DIRECT.
+
+Neste modo de validação, apenas **1 relay TCP** é procurado para a janela curta de startup; a aplicação não espera um segundo proxy redundante. O país do relay selecionado é registrado em `startup_proxy_status.json` quando a consulta geográfica estiver disponível.
+
+Na primeira execução dessa modalidade, a identidade e o perfil de teste são persistidos em `runtime\warp`. O build baixa `wgcf.exe` automaticamente e o incorpora ao EXE.
+
+Arquivos de diagnóstico adicionais:
+
+- `runtime\startup_proxy_status.json`: relay usado no startup e país quando a geolocalização estiver disponível.
+- `runtime\warp_status.json`: endpoint WireGuard, SOCKS local de validação, probe UDP e IP de egress obtido por STUN.
+- `runtime\split_validation.json`: compara voz DIRECT e egress UDP; `split_currently_active` acompanha o estado atual e `split_ever_validated` preserva a prova após a live terminar.
+- `runtime\sing-box-warp-proxy.log`: log do backend WARP userspace.
+- `runtime\sing-box-rtc-tun.log`: log do TUN estreito da transmissão.
+
+Fluxo do teste: entre primeiro na voz, aguarde `RTC SCREEN TUNNEL ARMADO`, confirme que a latência da voz continua normal e só então inicie a transmissão.
+
+## v13.3: UDP Hunt estrangeiro
+
+O modo normal de screen tunnel agora usa um scanner em estágios e procura o **egress UDP real**, não apenas um servidor que responda ao comando SOCKS5 `UDP ASSOCIATE`:
+
+```powershell
+.\ApplicationSplitRouting.exe --tunnel-screen
+```
+
+Pipeline:
+
+1. revalida `working_udp_proxies.json` e relays pequenos já conhecidos;
+2. tenta primeiro um feed SOCKS5 recente com metadata de país, latência e uptime;
+3. executa um STUN curto pelo SOCKS5 para provar UDP e descobrir o IP público real de saída;
+4. geolocaliza o IP de egress e rejeita `BR` por padrão;
+5. nos melhores candidatos estrangeiros, mantém **uma única associação UDP** aberta e envia uma série de 5 probes STUN;
+6. exige pelo menos 4/5 respostas, egress estável, mediana e p95 dentro dos limites;
+7. só então grava o relay em `working_udp_proxies.json` e o entrega ao TUN da `Connection(stream)`.
+
+Os feeds grandes de 100k+ IPs ficam como último recurso. Antes deles são usados feeds menores e atualizados com frequência. Reexecuções também reaproveitam `runtime\udp_probe_history.json`: relays que acabaram de falhar entram em cooldown e não consomem os mesmos timeouts novamente.
+
+Arquivos novos:
+
+- `runtime\udp_hunt_report.json`: sucessos STUN observados e finalistas estrangeiros, com país/RTT/jitter/confiabilidade;
+- `runtime\udp_probe_history.json`: histórico curto de falhas/sucessos usado para acelerar reexecuções;
+- `runtime\working_udp_proxies.json`: somente candidatos que passaram a validação estrangeira profunda.
+
+O país local excluído pode ser alterado, por exemplo:
+
+```powershell
+.\ApplicationSplitRouting.exe --tunnel-screen --udp-exclude-countries "BR,AR"
+```
+
+`--force-udp-scan` ignora o cooldown/cache e refaz a caça.
+
+### Validação persistente do split
+
+`split_validation.json` agora diferencia estado atual de prova histórica:
+
+- `split_currently_active`: `true` somente enquanto a transmissão validada está ativa;
+- `split_ever_validated`: permanece `true` depois que uma transmissão completou o split ao menos uma vez;
+- `validated_at`: timestamp da primeira prova;
+- `validation_evidence`: IP da voz, IP do backend, endpoint da tela e confirmação de que o IP observado pela sessão `stream` coincide com o egress STUN do relay.
+
+Encerrar a live não apaga mais uma validação bem-sucedida.

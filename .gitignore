@@ -13,3 +13,6 @@ dist/
 *.spec
 Thumbs.db
 .DS_Store
+
+# Downloaded build-time helper binaries
+bin/*.exe
