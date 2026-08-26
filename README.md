@@ -376,3 +376,7 @@ O país local excluído pode ser alterado, por exemplo:
 - `validation_evidence`: IP da voz, IP do backend, endpoint da tela e confirmação de que o IP observado pela sessão `stream` coincide com o egress STUN do relay.
 
 Encerrar a live não apaga mais uma validação bem-sucedida.
+
+### Busca por WARP estrangeiro
+
+`Com a utilização da API publica do WARP da cloudflare se provou separação de ips entre dados udp de voz e video. Agora preciso achar um ip ou mesh de ips validos gratuitos para fazer o tunel para o vídeo. 
