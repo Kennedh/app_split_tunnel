@@ -1,2 +1,1 @@
-requests>=2.31.0
-rich>=13.7.0
+# Archived public snapshot: no runtime dependencies are distributed here.

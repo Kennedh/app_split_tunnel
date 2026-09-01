@@ -10,9 +10,13 @@ runtime/
 *.log
 build/
 dist/
+bin/
+*.exe
+*.dll
+*.sys
 *.spec
+.env
+.env.*
+secrets.*
 Thumbs.db
 .DS_Store
-
-# Downloaded build-time helper binaries
-bin/*.exe

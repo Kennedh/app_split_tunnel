@@ -1,1 +1,5 @@
-"""Pacote com os módulos da ferramenta de Split Tunneling Local via Proxy."""
+"""Archived package placeholder.
+
+Networking modules from the active/private implementation are intentionally
+not included in this public snapshot.
+"""
